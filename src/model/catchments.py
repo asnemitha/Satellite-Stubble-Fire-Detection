@@ -18,6 +18,7 @@ data isn't available), not a placeholder -- but it should be swapped for
 D8 flow accumulation once a hydrologically-conditioned DEM is available
 (see docs/DESIGN.md sec 7).
 """
+
 from __future__ import annotations
 
 import numpy as np
@@ -32,40 +33,90 @@ def build_catchment_map(
     """Assign every surface cell to its nearest inlet node.
 
     Args:
-        node_cell_map: node_id -> (row, col) of that inlet on the surface grid.
+        node_cell_map: node_id -> (row, col) of that inlet on the
+            surface grid.
         shape: (rows, cols) of the surface grid.
-        dem: optional elevation grid; if provided with elevation_weight > 0,
-            cells are biased toward inlets they can plausibly drain downhill
-            to (cheap stand-in for real flow-direction routing).
-        elevation_weight: 0 = pure nearest-neighbor (Voronoi) catchments.
-            >0 additionally penalizes assigning a cell to an inlet that sits
-            *higher* than it (water doesn't flow uphill to a drain).
+        dem: optional elevation grid; if provided with
+            elevation_weight > 0, cells are biased toward inlets they
+            can plausibly drain downhill to (cheap stand-in for real
+            flow-direction routing).
+        elevation_weight: 0 = pure nearest-neighbor (Voronoi)
+            catchments. >0 additionally penalizes assigning a cell to
+            an inlet that sits *higher* than it (water doesn't flow
+            uphill to a drain).
 
     Returns:
-        (label_grid, node_ids): label_grid[r, c] is an index into node_ids
-        giving which node's catchment cell (r, c) belongs to. node_ids with
-        no cells assigned (shouldn't normally happen) simply get an empty
-        catchment.
+        (label_grid, node_ids): label_grid[r, c] is an index into
+        node_ids giving which node's catchment cell (r, c) belongs to.
+        node_ids with no cells assigned (shouldn't normally happen)
+        simply get an empty catchment.
     """
     rows, cols = shape
     node_ids = list(node_cell_map.keys())
-    if not node_ids:
-        return np.full(shape, -1, dtype=int), node_ids
 
-    node_rc = np.array([node_cell_map[nid] for nid in node_ids], dtype=float)  # (n, 2)
-    rr, cc = np.mgrid[0:rows, 0:cols]
-    # squared distance from every cell to every node -> (rows, cols, n)
-    d2 = (rr[..., None] - node_rc[:, 0]) ** 2 + (cc[..., None] - node_rc[:, 1]) ** 2
+    if not node_ids:
+        return np.full(
+            shape,
+            -1,
+            dtype=int,
+        ), node_ids
+
+    node_rc = np.array(
+        [
+            node_cell_map[nid]
+            for nid in node_ids
+        ],
+        dtype=float,
+    )
+
+    rr, cc = np.mgrid[
+        0:rows,
+        0:cols,
+    ]
+
+    # Squared distance from every cell to every node.
+    d2 = (
+        (
+            rr[..., None]
+            - node_rc[:, 0]
+        ) ** 2
+        + (
+            cc[..., None]
+            - node_rc[:, 1]
+        ) ** 2
+    )
 
     if dem is not None and elevation_weight > 0:
-        node_elev = np.array([dem[r, c] for (r, c) in node_rc.astype(int)])
+        node_elev = np.array(
+            [
+                dem[r, c]
+                for r, c in node_rc.astype(int)
+            ]
+        )
+
         cell_elev = dem[..., None]
-        uphill_penalty = np.clip(node_elev - cell_elev, 0, None) * elevation_weight
-        cost = d2 + uphill_penalty**2
+
+        uphill_penalty = (
+            np.clip(
+                node_elev - cell_elev,
+                0,
+                None,
+            )
+            * elevation_weight
+        )
+
+        cost = (
+            d2
+            + uphill_penalty**2
+        )
     else:
         cost = d2
 
-    label = np.argmin(cost, axis=-1)
+    label = np.argmin(
+        cost,
+        axis=-1,
+    )
+
     return label, node_ids
 
 
@@ -77,22 +128,40 @@ def aggregate_runoff_by_catchment(
 ) -> dict[str, float]:
     """Sum runoff (m^3/s) over every cell in each node's catchment.
 
-    This is the piece that actually fixes the bug: instead of reading a
-    single cell's runoff rate, we now integrate over the node's whole
-    contributing area.
+    Instead of reading a single cell's runoff rate, this integrates
+    runoff over the node's entire contributing area.
     """
     totals: dict[str, float] = {}
+
     flat_labels = label_grid.ravel()
     flat_runoff = runoff_grid.ravel()
+
     for i, nid in enumerate(node_ids):
         mask = flat_labels == i
-        totals[nid] = float(flat_runoff[mask].sum()) * cell_area
+
+        totals[nid] = (
+            float(flat_runoff[mask].sum())
+            * cell_area
+        )
+
     return totals
 
 
-def catchment_areas_m2(label_grid: np.ndarray, node_ids: list[str], cell_area: float) -> dict[str, float]:
-    """Contributing area (m^2) per node -- useful for diagnostics/UI and for
-    sizing node_storage_area realistically instead of using one constant for
-    every inlet regardless of how much street it actually serves."""
+def catchment_areas_m2(
+    label_grid: np.ndarray,
+    node_ids: list[str],
+    cell_area: float,
+) -> dict[str, float]:
+    """Calculate contributing area (m^2) per node.
+
+    Useful for diagnostics/UI and for sizing node_storage_area
+    realistically instead of using one constant for every inlet.
+    """
     flat = label_grid.ravel()
-    return {nid: float((flat == i).sum()) * cell_area for i, nid in enumerate(node_ids)}
+
+    return {
+        nid: float(
+            (flat == i).sum()
+        ) * cell_area
+        for i, nid in enumerate(node_ids)
+    }

@@ -1,8 +1,11 @@
 """Graph model of the underground drainage network.
 
-Nodes = manholes / inlets. Edges = pipes / canals.
+Nodes = manholes / inlets.
+Edges = pipes / canals.
+
 This is the structural backbone that the 1D hydraulic solver operates on.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -14,30 +17,49 @@ class Node:
     id: str
     x: float
     y: float
-    ground_elevation: float   # m, street/surface level
-    invert_elevation: float   # m, pipe channel bottom level at this node
-    is_outfall: bool = False  # discharges to river/sea, no backpressure
 
-    # runtime state, updated each timestep by the 1D solver
-    head: float = 0.0         # current hydraulic grade line elevation (m)
-    inflow: float = 0.0       # external inflow this timestep (m3/s), e.g. surface runoff
+    # Elevations in metres.
+    ground_elevation: float
+    invert_elevation: float
+
+    # True for the terminal node discharging to a river/sea.
+    is_outfall: bool = False
+
+    # Runtime state, updated by the 1D hydraulic solver.
+    head: float = 0.0
+    inflow: float = 0.0
 
     @property
     def max_depth(self) -> float:
-        return self.ground_elevation - self.invert_elevation
+        """Maximum available vertical storage between invert and ground."""
+        return max(
+            0.0,
+            self.ground_elevation - self.invert_elevation,
+        )
 
     @property
     def is_surcharged(self) -> bool:
-        """True once the hydraulic grade line reaches the surface -> street flooding."""
+        """Whether the hydraulic grade line has reached the street."""
         return self.head >= self.ground_elevation
 
     @property
     def fill_fraction(self) -> float:
-        """How full the node is, 0 (invert) -> 1 (ground level), can exceed 1 when surcharged."""
+        """Node hydraulic filling relative to invert-to-ground depth.
+
+        Values:
+            0.0 -> water level at invert
+            1.0 -> water level at ground
+            >1.0 -> hydraulic grade line above ground (surcharge)
+        """
+
         span = self.max_depth
-        if span <= 0:
-            return 1.0
-        return (self.head - self.invert_elevation) / span
+
+        if span <= 0.0:
+            return 1.0 if self.head >= self.ground_elevation else 0.0
+
+        return (
+            self.head - self.invert_elevation
+        ) / span
 
 
 @dataclass
@@ -45,64 +67,169 @@ class Edge:
     id: str
     from_node: str
     to_node: str
-    length: float              # m
-    diameter: float            # m (circular pipe equivalent)
-    slope: float                # m/m, positive = downhill from_node -> to_node
-    manning_n: float = 0.013    # roughness coefficient (concrete ~0.013)
-    condition_factor: float = 1.0  # 0-1 derate for siltation/blockage/collapse
 
-    # runtime state
-    flow: float = 0.0           # m3/s, current flow
+    length: float
+    diameter: float
+    slope: float
+
+    manning_n: float = 0.013
+
+    # 0 = completely blocked/unusable
+    # 1 = nominal capacity
+    condition_factor: float = 1.0
+
+    # Runtime flow in m3/s.
+    flow: float = 0.0
 
     @property
     def area(self) -> float:
-        return math.pi * (self.diameter / 2) ** 2
+        """Cross-sectional area of a circular pipe in m2."""
+        if self.diameter <= 0.0:
+            return 0.0
+
+        return math.pi * (self.diameter / 2.0) ** 2
 
     def full_flow_capacity(self) -> float:
-        """Manning's equation full-pipe capacity (m3/s), derated by condition."""
-        if self.slope <= 0:
+        """Manning full-pipe capacity in m3/s.
+
+        Capacity is derated by condition_factor.
+        """
+
+        # Invalid geometry/roughness cannot convey flow.
+        if (
+            self.diameter <= 0.0
+            or self.manning_n <= 0.0
+            or self.slope <= 0.0
+            or self.condition_factor <= 0.0
+        ):
             return 0.0
-        r_h = self.diameter / 4  # hydraulic radius of a full circular pipe
-        v = (1.0 / self.manning_n) * (r_h ** (2 / 3)) * math.sqrt(self.slope)
-        return v * self.area * self.condition_factor
+
+        # Prevent invalid condition factors from artificially
+        # increasing pipe capacity above nominal.
+        condition = min(
+            1.0,
+            self.condition_factor,
+        )
+
+        # Hydraulic radius of a full circular pipe:
+        # R = A/P = D/4.
+        hydraulic_radius = self.diameter / 4.0
+
+        velocity = (
+            1.0 / self.manning_n
+        ) * (
+            hydraulic_radius ** (2.0 / 3.0)
+        ) * math.sqrt(self.slope)
+
+        capacity = (
+            velocity
+            * self.area
+            * condition
+        )
+
+        return max(0.0, capacity)
 
     @property
     def utilization(self) -> float:
-        """Current flow as a fraction of full-pipe capacity (0-1+, diagnostics/UI)."""
-        cap = self.full_flow_capacity()
-        return (self.flow / cap) if cap > 0 else 0.0
+        """Current flow as a fraction of full-pipe capacity.
+
+        Can exceed 1.0 when the pipe is overloaded.
+        """
+
+        capacity = self.full_flow_capacity()
+
+        if capacity <= 0.0:
+            return 0.0
+
+        # Absolute value allows diagnostics to remain meaningful if
+        # the hydraulic solver permits reverse flow.
+        return abs(self.flow) / capacity
 
 
 @dataclass
 class DrainageGraph:
     nodes: dict[str, Node] = field(default_factory=dict)
     edges: dict[str, Edge] = field(default_factory=dict)
-    _adj: dict[str, list[str]] = field(default_factory=dict)  # node_id -> outgoing edge ids
+
+    # node_id -> outgoing edge IDs
+    _adj: dict[str, list[str]] = field(default_factory=dict)
 
     def add_node(self, node: Node) -> None:
+        """Add or replace a drainage node."""
+
         self.nodes[node.id] = node
         self._adj.setdefault(node.id, [])
 
     def add_edge(self, edge: Edge) -> None:
+        """Add a directed drainage edge.
+
+        The edge is assumed to flow from from_node -> to_node.
+        """
+
+        if edge.from_node not in self.nodes:
+            raise ValueError(
+                f"Edge '{edge.id}' references unknown "
+                f"from_node '{edge.from_node}'."
+            )
+
+        if edge.to_node not in self.nodes:
+            raise ValueError(
+                f"Edge '{edge.id}' references unknown "
+                f"to_node '{edge.to_node}'."
+            )
+
         self.edges[edge.id] = edge
-        self._adj.setdefault(edge.from_node, []).append(edge.id)
-        # Ensure to_node also has an adjacency-list entry even if it was never
-        # explicitly added via add_node (e.g. the outfall in auto-built networks).
-        # Without this, downstream_edges() silently returns [] for such nodes.
-        self._adj.setdefault(edge.to_node, [])
+
+        self._adj.setdefault(
+            edge.from_node,
+            [],
+        )
+
+        self._adj[edge.from_node].append(
+            edge.id
+        )
+
+        self._adj.setdefault(
+            edge.to_node,
+            [],
+        )
 
     def downstream_edges(self, node_id: str) -> list[Edge]:
-        return [self.edges[eid] for eid in self._adj.get(node_id, [])]
+        """Return all pipes leaving a node."""
+
+        return [
+            self.edges[edge_id]
+            for edge_id in self._adj.get(node_id, [])
+            if edge_id in self.edges
+        ]
 
     def surcharged_nodes(self) -> list[Node]:
-        """Nodes currently backing up to street level -> sources for the 2D surface model."""
-        return [n for n in self.nodes.values() if n.is_surcharged]
+        """Return nodes whose hydraulic grade reaches the street."""
+
+        return [
+            node
+            for node in self.nodes.values()
+            if node.is_surcharged
+        ]
 
     @classmethod
-    def from_geojson_like(cls, nodes_data: list[dict], edges_data: list[dict]) -> "DrainageGraph":
-        g = cls()
-        for nd in nodes_data:
-            g.add_node(Node(**nd))
-        for ed in edges_data:
-            g.add_edge(Edge(**ed))
-        return g
+    def from_geojson_like(
+        cls,
+        nodes_data: list[dict],
+        edges_data: list[dict],
+    ) -> "DrainageGraph":
+        """Construct a graph from node/edge dictionaries."""
+
+        graph = cls()
+
+        for node_data in nodes_data:
+            graph.add_node(
+                Node(**node_data)
+            )
+
+        for edge_data in edges_data:
+            graph.add_edge(
+                Edge(**edge_data)
+            )
+
+        return graph

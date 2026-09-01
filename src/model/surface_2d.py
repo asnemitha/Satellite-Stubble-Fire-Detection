@@ -1,132 +1,291 @@
-"""2D surface inundation model.
+"""1D hydraulic routing through the drainage network graph.
 
-Local-inertial (diffusive wave) approximation of shallow water flow over a DEM
-grid — the LISFLOOD-FP style method used because it is stable at real-time
-timesteps and vectorizes cleanly (numpy here; swap for CuPy/CUDA for GPU scale).
+Simplified explicit storage-routing scheme.
+
+The model represents each node as a storage volume and each pipe as a
+capacity-limited connection between node hydraulic heads.
+
+Coupling with the 2D surface model is mass-conservative:
+
+    external runoff -> node storage -> pipe routing
+                              |
+                              v
+                         surcharge
+                              |
+                              v
+                         2D surface
+                              |
+                              v
+                           re-entry
+                              |
+                              +----> node storage
+
+This is a lightweight kinematic approximation suitable for real-time
+nowcasting. A full Saint-Venant / SWMM-style dynamic-wave solver can replace
+the routing core later without changing the graph interface.
 """
+
 from __future__ import annotations
 
 import math
 
-import numpy as np
-
-GRAVITY = 9.81
+from .drainage_graph import DrainageGraph
 
 
-class SurfaceGrid:
-    def __init__(self, dem: np.ndarray, cell_size: float, manning_n: np.ndarray | float = 0.03):
-        """
-        dem: 2D array of ground elevation (m), shape (rows, cols)
-        cell_size: grid resolution (m)
-        manning_n: scalar or per-cell roughness array
-        """
-        self.dem = dem
-        self.cell_size = cell_size
-        self.manning_n = manning_n if isinstance(manning_n, np.ndarray) else np.full_like(dem, manning_n)
-        self.depth = np.zeros_like(dem)          # water depth (m)
-        self.qx = np.zeros_like(dem)              # flux in x (m2/s)
-        self.qy = np.zeros_like(dem)              # flux in y (m2/s)
+DEFAULT_NODE_STORAGE_AREA = 4.0  # m²
 
-    def inject(self, row: int, col: int, volume_rate: float, dt: float) -> None:
-        """Add a source term (m3/s) at a cell, e.g. a surcharging manhole or rainfall."""
-        self.depth[row, col] += (volume_rate * dt) / (self.cell_size ** 2)
 
-    def step(self, dt: float, cfl: float = 0.4, max_substeps: int = 500) -> None:
-        """Advance the surface by dt seconds, internally subdividing into
-        CFL-stable sub-steps.
+def _storage_area(
+    node_id: str,
+    node_storage_area: float | dict[str, float],
+) -> float:
+    """Return the effective storage area for a node."""
 
-        The explicit local-inertial scheme below is only stable when dt is
-        small relative to how fast a shallow-water wave can cross a cell
-        (dt <~ cfl * cell_size / sqrt(g * depth)). A fixed, hand-picked
-        dt_seconds that's fine for shallow ponding blows up (NaN via
-        overflow) the moment a real surcharge event pushes local depth up --
-        exactly the "flooding actually happens now" case the rest of this
-        fix was aiming for. So: pick a stable sub-step from the current
-        worst-case depth each call, rather than trusting the caller's dt
-        blindly. `max_substeps` is a hard cap (not a floor) so a pathological
-        depth spike degrades to a bounded amount of extra compute instead of
-        stalling the run; if it's hit, the excess time is applied at the
-        smallest stable step anyway rather than silently going unstable.
-        """
-        remaining = dt
-        sub_dt = dt  # safe fallback; overwritten immediately inside the loop
-        for _ in range(max_substeps):
-            if remaining <= 1e-9:
-                return
-            hmax = float(np.max(self.depth))
-            if hmax > 1e-6:
-                stable_dt = cfl * self.cell_size / math.sqrt(GRAVITY * hmax)
-            else:
-                stable_dt = remaining
-            sub_dt = min(stable_dt, remaining)
-            self._step_once(sub_dt)
-            remaining -= sub_dt
-        if remaining > 1e-9:
-            # exhausted the substep budget with time left -- take it at the
-            # last-known-stable size rather than dumping it in one unstable step
-            self._step_once(min(sub_dt, remaining))
-
-    def _step_once(self, dt: float) -> None:
-        wse = self.dem + self.depth  # water surface elevation
-
-        # water surface slope, x and y directions
-        dwse_dx = np.zeros_like(wse)
-        dwse_dx[:, :-1] = (wse[:, 1:] - wse[:, :-1]) / self.cell_size
-        dwse_dy = np.zeros_like(wse)
-        dwse_dy[:-1, :] = (wse[1:, :] - wse[:-1, :]) / self.cell_size
-
-        h_flow_x = np.maximum(self.depth[:, :-1], self.depth[:, 1:]) if wse.shape[1] > 1 else self.depth
-        h_flow_y = np.maximum(self.depth[:-1, :], self.depth[1:, :]) if wse.shape[0] > 1 else self.depth
-
-        n = self.manning_n
-        # local inertial flux update (simplified explicit form)
-        qx_new = np.zeros_like(self.qx)
-        qy_new = np.zeros_like(self.qy)
-        eps = 1e-6
-
-        hx = np.zeros_like(wse); hx[:, :-1] = h_flow_x
-        qx_new[:, :-1] = (self.qx[:, :-1] - GRAVITY * hx[:, :-1] * dt * dwse_dx[:, :-1]) / (
-            1 + GRAVITY * dt * n[:, :-1] ** 2 * np.abs(self.qx[:, :-1]) / (hx[:, :-1] ** (7 / 3) + eps)
+    if isinstance(node_storage_area, dict):
+        area = node_storage_area.get(
+            node_id,
+            DEFAULT_NODE_STORAGE_AREA,
         )
-        hy = np.zeros_like(wse); hy[:-1, :] = h_flow_y
-        qy_new[:-1, :] = (self.qy[:-1, :] - GRAVITY * hy[:-1, :] * dt * dwse_dy[:-1, :]) / (
-            1 + GRAVITY * dt * n[:-1, :] ** 2 * np.abs(self.qy[:-1, :]) / (hy[:-1, :] ** (7 / 3) + eps)
+    else:
+        area = node_storage_area
+
+    try:
+        area = float(area)
+    except (TypeError, ValueError):
+        area = DEFAULT_NODE_STORAGE_AREA
+
+    if not math.isfinite(area) or area <= 0.0:
+        return DEFAULT_NODE_STORAGE_AREA
+
+    return area
+
+
+def route_timestep(
+    graph: DrainageGraph,
+    dt: float,
+    node_storage_area: float | dict[str, float] = DEFAULT_NODE_STORAGE_AREA,
+) -> None:
+    """Advance the 1D drainage network by one timestep.
+
+    Args:
+        graph:
+            Drainage network containing nodes and pipes.
+
+        dt:
+            Timestep in seconds.
+
+        node_storage_area:
+            Effective storage/ponding area at each node in m².
+            Either a single value for all nodes or a dictionary mapping
+            node IDs to areas.
+
+    Notes:
+        ``node.inflow`` is an external inflow accumulator in m³/s.
+        It is consumed exactly once during this timestep and reset to zero
+        before returning.
+
+        Outfall nodes are treated as fixed downstream boundaries. Their
+        incoming flow leaves the model domain.
+    """
+
+    if dt <= 0.0 or not math.isfinite(dt):
+        raise ValueError("dt must be a finite positive number.")
+
+    # ------------------------------------------------------------------
+    # 1. Calculate pipe flows.
+    #
+    # Flow is driven by the difference between the upstream and
+    # downstream hydraulic grade lines.
+    #
+    # We intentionally clamp the driving head to zero because this
+    # simplified solver does not model reverse flow.
+    # ------------------------------------------------------------------
+
+    for edge in graph.edges.values():
+
+        if edge.from_node not in graph.nodes:
+            raise ValueError(
+                f"Edge '{edge.id}' references unknown "
+                f"from_node '{edge.from_node}'."
+            )
+
+        if edge.to_node not in graph.nodes:
+            raise ValueError(
+                f"Edge '{edge.id}' references unknown "
+                f"to_node '{edge.to_node}'."
+            )
+
+        upstream = graph.nodes[edge.from_node]
+        downstream = graph.nodes[edge.to_node]
+
+        capacity = edge.full_flow_capacity()
+
+        if capacity <= 0.0:
+            edge.flow = 0.0
+            continue
+
+        # Hydraulic gradient driving the pipe.
+        driving_head = max(
+            0.0,
+            upstream.head - downstream.head,
         )
 
-        self.qx, self.qy = qx_new, qy_new
+        # Convert available head into an approximate discharge.
+        #
+        # [m²] * [m] / [s] = [m³/s]
+        demand = (
+            _storage_area(
+                edge.from_node,
+                node_storage_area,
+            )
+            * driving_head
+            / dt
+        )
 
-        # continuity: update depth from flux divergence
-        div = np.zeros_like(self.depth)
-        div[:, 1:] += self.qx[:, :-1]
-        div[:, :-1] -= self.qx[:, :-1]
-        div[1:, :] += self.qy[:-1, :]
-        div[:-1, :] -= self.qy[:-1, :]
+        edge.flow = min(
+            capacity,
+            max(0.0, demand),
+        )
 
-        self.depth = np.maximum(0.0, self.depth + (div * dt) / self.cell_size)
-        self._apply_open_boundary(dt)
+    # ------------------------------------------------------------------
+    # 2. Node mass balance.
+    #
+    # net_flow is positive when water enters a node and negative when
+    # water leaves it.
+    # ------------------------------------------------------------------
 
-    def _apply_open_boundary(self, dt: float, weir_coeff: float = 1.2) -> None:
-        """Let water leave the edge of the modeled tile instead of piling up
-        against an implicit wall.
+    net_flow: dict[str, float] = {
+        node_id: float(node.inflow)
+        for node_id, node in graph.nodes.items()
+    }
 
-        The finite-volume update above has no flux term across the outer
-        boundary, so a closed rectangular study area would behave like a
-        bathtub -- every drop of rain that isn't captured by a pipe stays on
-        the grid forever, and depth grows without bound over a multi-hour
-        run regardless of how well the drainage network performs. Real study
-        tiles sit inside a larger city that keeps draining past the edge, so
-        each boundary cell gets a broad-crested-weir-style outflow term
-        proportional to depth^1.5 -- an approximation of "water keeps moving
-        toward wherever this tile's downstream neighbor is", not a precise
-        transmissive boundary condition.
-        """
-        if self.depth.shape[0] < 2 or self.depth.shape[1] < 2:
-            return
-        q = weir_coeff * np.power(np.maximum(self.depth, 0.0), 1.5) * dt / self.cell_size
-        self.depth[0, :] = np.maximum(0.0, self.depth[0, :] - q[0, :])
-        self.depth[-1, :] = np.maximum(0.0, self.depth[-1, :] - q[-1, :])
-        self.depth[:, 0] = np.maximum(0.0, self.depth[:, 0] - q[:, 0])
-        self.depth[:, -1] = np.maximum(0.0, self.depth[:, -1] - q[:, -1])
+    for edge in graph.edges.values():
 
-    def depth_cm(self) -> np.ndarray:
-        return self.depth * 100.0
+        # Water leaves from_node.
+        net_flow[edge.from_node] -= edge.flow
+
+        # Water enters to_node.
+        net_flow[edge.to_node] = (
+            net_flow.get(edge.to_node, 0.0)
+            + edge.flow
+        )
+
+    # ------------------------------------------------------------------
+    # 3. Convert node volume change into hydraulic-head change.
+    #
+    # dV = Q * dt
+    # dH = dV / A
+    # ------------------------------------------------------------------
+
+    for node_id, node in graph.nodes.items():
+
+        # An outfall is a boundary condition rather than a storage node.
+        # Incoming water is discharged from the model.
+        if node.is_outfall:
+            continue
+
+        area = _storage_area(
+            node_id,
+            node_storage_area,
+        )
+
+        volume_change = net_flow[node_id] * dt
+
+        head_change = volume_change / area
+
+        node.head += head_change
+
+        # Do not allow the hydraulic head to fall below the pipe invert.
+        node.head = max(
+            node.invert_elevation,
+            node.head,
+        )
+
+    # ------------------------------------------------------------------
+    # 4. Consume this timestep's external inflows.
+    #
+    # IMPORTANT:
+    # rainfall runoff and surface re-entry are accumulated before
+    # route_timestep() and must not persist into the next timestep.
+    # ------------------------------------------------------------------
+
+    for node in graph.nodes.values():
+        node.inflow = 0.0
+
+
+def surface_source_terms(
+    graph: DrainageGraph,
+    dt: float,
+    node_storage_area: float | dict[str, float] = DEFAULT_NODE_STORAGE_AREA,
+) -> dict[str, float]:
+    """Convert 1D surcharge above street level into 2D source flow.
+
+    This operation is deliberately MASS CONSERVATIVE.
+
+    If a node's hydraulic head rises above the ground elevation, the excess
+    volume above street level is removed from the 1D node storage and
+    returned as a discharge rate for the 2D surface model.
+
+    Therefore:
+
+        volume removed from 1D == volume injected into 2D
+
+    Args:
+        graph:
+            Drainage network.
+
+        dt:
+            Timestep in seconds.
+
+        node_storage_area:
+            Effective storage area at each node in m².
+
+    Returns:
+        Dictionary mapping node IDs to surface discharge rates in m³/s.
+    """
+
+    if dt <= 0.0 or not math.isfinite(dt):
+        raise ValueError("dt must be a finite positive number.")
+
+    sources: dict[str, float] = {}
+
+    for node_id, node in graph.nodes.items():
+
+        # Outfalls do not surcharge onto the street.
+        if node.is_outfall:
+            continue
+
+        excess_head = (
+            node.head - node.ground_elevation
+        )
+
+        if excess_head <= 0.0:
+            continue
+
+        area = _storage_area(
+            node_id,
+            node_storage_area,
+        )
+
+        # Volume physically stored above street level.
+        excess_volume = excess_head * area
+
+        if excess_volume <= 0.0:
+            continue
+
+        # Convert the excess volume into a discharge rate for this
+        # timestep.
+        source_rate = excess_volume / dt
+
+        if source_rate <= 0.0:
+            continue
+
+        # Remove exactly the volume that will be injected into the
+        # 2D surface.
+        #
+        # This is the key mass-conservation correction.
+        node.head = node.ground_elevation
+
+        sources[node_id] = source_rate
+
+    return sources
