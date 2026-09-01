@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Flood Nowcast — Live Street-Level Forecast</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@500;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --void: #060a10;
+    --surface: #0e161f;
+    --surface-raised: #16212c;
+    --border: #22323f;
+    --text: #eaf1f7;
+    --text-dim: #7e93a7;
+    --alert: #ff7a45;
+    --critical: #ff5252;
+    --band-1: #bfe3ff;
+    --band-2: #5aa8e0;
+    --band-3: #1f5f9e;
+    --band-4: #ff5252;
+    --ok: #4ade80;
+    --focus: #5aa8e0;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: var(--void);
+    color: var(--text);
+    font-family: 'Manrope', -apple-system, sans-serif;
+  }
+
+  .mono { font-family: 'JetBrains Mono', ui-monospace, monospace; }
+
+  #map { position: absolute; inset: 0; }
+  #map .leaflet-control-attribution { background: rgba(6,10,16,0.7); color: var(--text-dim); }
+  #map .leaflet-control-attribution a { color: var(--text-dim); }
+
+  :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+
+  /* ---------- Header ---------- */
+  #header {
+    position: absolute; top: 0; left: 0; right: 0; z-index: 1000;
+    display: flex; align-items: center; gap: 16px;
+    padding: 14px 18px;
+    background: linear-gradient(to bottom, rgba(6,10,16,0.92), rgba(6,10,16,0.55) 80%, transparent);
+    pointer-events: none;
+  }
+  #header > * { pointer-events: auto; }
+
+  .brand { display: flex; align-items: baseline; gap: 10px; }
+  .brand-mark {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: var(--ok); flex-shrink: 0;
+    box-shadow: 0 0 0 3px rgba(74,222,128,0.18);
+  }
+  .brand-mark.degraded { background: var(--alert); box-shadow: 0 0 0 3px rgba(255,122,69,0.2); }
+  .brand-mark.down { background: var(--critical); box-shadow: 0 0 0 3px rgba(255,82,82,0.2); }
+  .brand h1 {
+    font-size: 16px; font-weight: 800; margin: 0; letter-spacing: 0.2px;
+  }
+  .brand .city {
+    font-size: 13px; color: var(--text-dim); font-weight: 500;
+  }
+
+  .status-line {
+    margin-left: auto;
+    text-align: right;
+    font-size: 12px;
+    color: var(--text-dim);
+    line-height: 1.5;
+  }
+  .status-line .value { color: var(--text); }
+
+  /* ---------- Banner ---------- */
+  #banner {
+    position: absolute; top: 62px; left: 18px; right: 18px; z-index: 1001;
+    background: var(--surface-raised);
+    border: 1px solid var(--critical);
+    border-left-width: 4px;
+    border-radius: 6px;
+    padding: 10px 14px;
+    font-size: 13px;
+    display: none;
+    align-items: center;
+    gap: 12px;
+    max-width: 480px;
+  }
+  #banner.show { display: flex; }
+  #banner .msg { flex: 1; }
+  #banner .msg .title { font-weight: 700; display: block; margin-bottom: 2px; }
+  #banner .msg .detail { color: var(--text-dim); }
+  #banner button {
+    background: var(--critical); color: #1a0505; border: none;
+    padding: 6px 12px; border-radius: 4px; font-weight: 700;
+    font-size: 12px; cursor: pointer; font-family: inherit;
+  }
+  #banner button:hover { filter: brightness(1.1); }
+
+  /* ---------- Side panel ---------- */
+  #side-panel {
+    position: absolute; top: 70px; right: 16px; z-index: 999;
+    width: 190px;
+    background: rgba(14,22,31,0.88);
+    backdrop-filter: blur(6px);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px;
+  }
+  #side-panel h2 {
+    font-size: 11px; text-transform: none; letter-spacing: 0.2px;
+    color: var(--text-dim); margin: 0 0 10px; font-weight: 600;
+  }
+
+  .scale-row { display: flex; gap: 10px; }
+  .scale-bar {
+    width: 14px; height: 130px; border-radius: 4px;
+    background: linear-gradient(to top, var(--band-4) 0%, var(--band-4) 24%, var(--band-3) 24%, var(--band-3) 50%, var(--band-2) 50%, var(--band-2) 75%, var(--band-1) 75%, var(--band-1) 100%);
+    flex-shrink: 0;
+  }
+  .scale-labels {
+    display: flex; flex-direction: column-reverse; justify-content: space-between;
+    font-size: 11px; color: var(--text-dim);
+  }
+  .scale-labels div { line-height: 1; padding: 2px 0; }
+  .scale-labels .lbl-name { color: var(--text); font-weight: 600; }
+  .scale-labels .lbl-sub { font-size: 10px; }
+
+  .stat-block { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--border); }
+  .stat-row { display: flex; justify-content: space-between; font-size: 12px; padding: 3px 0; }
+  .stat-row .k { color: var(--text-dim); }
+  .stat-row .v { font-weight: 600; }
+  .stat-row .v.hot { color: var(--critical); }
+
+  /* ---------- Bottom timeline ---------- */
+  #timeline {
+    position: absolute; left: 16px; right: 16px; bottom: 16px; z-index: 999;
+    background: rgba(14,22,31,0.92);
+    backdrop-filter: blur(6px);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 12px 18px;
+  }
+  .timeline-top { display: flex; align-items: center; gap: 14px; margin-bottom: 8px; }
+
+  #playBtn {
+    width: 32px; height: 32px; border-radius: 50%; flex-shrink: 0;
+    background: var(--surface-raised); border: 1px solid var(--border);
+    color: var(--text); cursor: pointer; display: flex; align-items: center; justify-content: center;
+    font-size: 13px;
+  }
+  #playBtn:hover { border-color: var(--focus); }
+
+  #leadLabel {
+    font-weight: 700; font-size: 15px; min-width: 92px;
+  }
+  #leadLabel.now { color: var(--ok); }
+
+  #issuedTag { margin-left: auto; font-size: 11px; color: var(--text-dim); }
+
+  .slider-wrap { position: relative; padding: 0 2px; }
+  input[type=range] {
+    width: 100%; margin: 0; height: 20px;
+    -webkit-appearance: none; appearance: none;
+    background: transparent;
+  }
+  input[type=range]::-webkit-slider-runnable-track {
+    height: 4px; border-radius: 2px;
+    background: var(--border);
+  }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; margin-top: -7px;
+    width: 18px; height: 18px; border-radius: 50%;
+    background: var(--focus); border: 3px solid var(--void);
+    box-shadow: 0 0 0 1px var(--focus);
+    cursor: pointer;
+  }
+  input[type=range]::-moz-range-track {
+    height: 4px; border-radius: 2px; background: var(--border);
+  }
+  input[type=range]::-moz-range-thumb {
+    width: 12px; height: 12px; border-radius: 50%;
+    background: var(--focus); border: 3px solid var(--void);
+    cursor: pointer;
+  }
+
+  .ticks {
+    display: flex; justify-content: space-between;
+    font-size: 10px; color: var(--text-dim); margin-top: 2px;
+    padding: 0 1px;
+  }
+
+  @media (max-width: 640px) {
+    #side-panel { top: auto; bottom: 112px; right: 12px; left: 12px; width: auto; }
+    .scale-row { justify-content: flex-start; }
+    .stat-block { display: none; }
+    #header { flex-wrap: wrap; }
+    .status-line { margin-left: 0; text-align: left; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; }
+  }
+</style>
+</head>
+<body>
+<div id="map" role="application" aria-label="Flood depth forecast map"></div>
+
+<header id="header">
+  <div class="brand">
+    <span class="brand-mark" id="statusDot"></span>
+    <h1>Flood Nowcast</h1>
+    <span class="city" id="cityLabel">Mumbai</span>
+  </div>
+  <div class="status-line">
+    <div>scenario <span class="value mono" id="scenarioVal">—</span></div>
+    <div>issued <span class="value mono" id="issuedVal">—</span></div>
+  </div>
+</header>
+
+<div id="banner">
+  <div class="msg">
+    <span class="title" id="bannerTitle">Can't reach the forecast service</span>
+    <span class="detail" id="bannerDetail">Check that the API is running at the configured address.</span>
+  </div>
+  <button id="bannerRetry">Retry</button>
+</div>
+
+<div id="side-panel">
+  <h2>Depth vs. safe passage</h2>
+  <div class="scale-row">
+    <div class="scale-bar"></div>
+    <div class="scale-labels">
+      <div><div class="lbl-name">30+ cm</div><div class="lbl-sub">emergency vehicles only</div></div>
+      <div><div class="lbl-name">15–30 cm</div><div class="lbl-sub">cars stall</div></div>
+      <div><div class="lbl-name">10–15 cm</div><div class="lbl-sub">cars caution</div></div>
+      <div><div class="lbl-name">0–10 cm</div><div class="lbl-sub">walkable</div></div>
+    </div>
+  </div>
+  <div class="stat-block" id="statBlock">
+    <div class="stat-row"><span class="k">max depth</span><span class="v mono" id="statMax">—</span></div>
+    <div class="stat-row"><span class="k">mean depth</span><span class="v mono" id="statMean">—</span></div>
+    <div class="stat-row"><span class="k">cells &gt; 30cm</span><span class="v mono hot" id="statCritical">—</span></div>
+  </div>
+</div>
+
+<div id="timeline">
+  <div class="timeline-top">
+    <button id="playBtn" aria-label="Play forecast animation">▶</button>
+    <span id="leadLabel" class="mono now">NOW</span>
+    <span id="issuedTag" class="mono"></span>
+  </div>
+  <div class="slider-wrap">
+    <input type="range" id="leadSlider" min="0" max="180" step="15" value="0"
+           aria-label="Forecast lead time in minutes">
+  </div>
+  <div class="ticks mono">
+    <span>now</span><span>+45m</span><span>+90m</span><span>+135m</span><span>+180m</span>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+// Point this at the deployed API base URL.
+const API_BASE = "http://localhost:8000";
+
+const map = L.map('map', { zoomControl: false, attributionControl: true }).setView([19.0760, 72.8777], 14);
+L.control.zoom({ position: 'bottomleft' }).addTo(map);
+L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png', {
+  attribution: '&copy; OpenStreetMap contributors &copy; CARTO',
+  subdomains: 'abcd',
+  maxZoom: 19,
+}).addTo(map);
+
+let depthLayer = null;
+let playTimer = null;
+
+const statusDot = document.getElementById('statusDot');
+const banner = document.getElementById('banner');
+const bannerDetail = document.getElementById('bannerDetail');
+const scenarioVal = document.getElementById('scenarioVal');
+const issuedVal = document.getElementById('issuedVal');
+const issuedTag = document.getElementById('issuedTag');
+const statMax = document.getElementById('statMax');
+const statMean = document.getElementById('statMean');
+const statCritical = document.getElementById('statCritical');
+const slider = document.getElementById('leadSlider');
+const label = document.getElementById('leadLabel');
+const playBtn = document.getElementById('playBtn');
+
+function setStatus(state) {
+  statusDot.className = 'brand-mark' + (state === 'ok' ? '' : state === 'degraded' ? ' degraded' : ' down');
+}
+
+function showBanner(title, detail) {
+  document.getElementById('bannerTitle').textContent = title;
+  bannerDetail.textContent = detail;
+  banner.classList.add('show');
+}
+function hideBanner() { banner.classList.remove('show'); }
+
+function depthToColor(cm) {
+  if (cm <= 0) return null;
+  if (cm < 10) return getComputedStyle(document.documentElement).getPropertyValue('--band-1').trim();
+  if (cm < 15) return getComputedStyle(document.documentElement).getPropertyValue('--band-2').trim();
+  if (cm < 30) return getComputedStyle(document.documentElement).getPropertyValue('--band-3').trim();
+  return getComputedStyle(document.documentElement).getPropertyValue('--band-4').trim();
+}
+
+async function loadDepthGrid(leadMinutes) {
+  try {
+    const res = await fetch(`${API_BASE}/forecast/depth?lead_minutes=${leadMinutes}`);
+    if (!res.ok) {
+      if (res.status === 404) {
+        setStatus('degraded');
+        showBanner('No forecast for this lead time', `The service hasn't produced a grid for t+${leadMinutes} min yet.`);
+      } else {
+        throw new Error(`HTTP ${res.status}`);
+      }
+      return;
+    }
+    hideBanner();
+    setStatus('ok');
+    const data = await res.json();
+    renderGrid(data);
+    if (data.issued_at) {
+      const t = new Date(data.issued_at);
+      issuedVal.textContent = t.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      issuedTag.textContent = `cycle issued ${t.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
+    }
+  } catch (err) {
+    setStatus('down');
+    showBanner("Can't reach the forecast service", `No response from ${API_BASE}. Is the API running?`);
+  }
+}
+
+async function loadSummary() {
+  try {
+    const res = await fetch(`${API_BASE}/forecast/summary`);
+    if (!res.ok) return;
+    const data = await res.json();
+    scenarioVal.textContent = data.scenario || '—';
+    const lead = parseInt(slider.value, 10);
+    const row = (data.series || []).find(r => r.lead_minutes === lead);
+    if (row) {
+      statMax.textContent = `${row.max_depth_cm.toFixed(1)} cm`;
+      statMean.textContent = `${row.mean_depth_cm.toFixed(1)} cm`;
+      statCritical.textContent = row.cells_over_30cm;
+    }
+  } catch (err) {
+    // Summary is supplementary; failures here don't block the map.
+  }
+}
+
+function renderGrid(data) {
+  if (depthLayer) map.removeLayer(depthLayer);
+  const [originLat, originLon] = data.origin;
+  const cellSizeDeg = data.cell_size_m / 111000; // rough conversion, replace with proper CRS transform
+  const rects = [];
+  data.depth_cm.forEach((row, r) => {
+    row.forEach((cm, c) => {
+      const color = depthToColor(cm);
+      if (!color) return;
+      const lat0 = originLat - r * cellSizeDeg;
+      const lon0 = originLon + c * cellSizeDeg;
+      rects.push(L.rectangle(
+        [[lat0, lon0], [lat0 - cellSizeDeg, lon0 + cellSizeDeg]],
+        { color, weight: 0, fillOpacity: 0.62 }
+      ));
+    });
+  });
+  depthLayer = L.layerGroup(rects).addTo(map);
+}
+
+function refresh() {
+  const lead = parseInt(slider.value, 10);
+  label.textContent = lead === 0 ? 'NOW' : `+${lead} min`;
+  label.classList.toggle('now', lead === 0);
+  loadDepthGrid(lead);
+  loadSummary();
+}
+
+slider.addEventListener('input', refresh);
+
+playBtn.addEventListener('click', () => {
+  if (playTimer) {
+    clearInterval(playTimer);
+    playTimer = null;
+    playBtn.textContent = '▶';
+    playBtn.setAttribute('aria-label', 'Play forecast animation');
+    return;
+  }
+  playBtn.textContent = '⏸';
+  playBtn.setAttribute('aria-label', 'Pause forecast animation');
+  playTimer = setInterval(() => {
+    let next = parseInt(slider.value, 10) + parseInt(slider.step, 10);
+    if (next > parseInt(slider.max, 10)) next = 0;
+    slider.value = next;
+    refresh();
+  }, 1400);
+});
+
+document.getElementById('bannerRetry').addEventListener('click', refresh);
+
+refresh();
+</script>
+</body>
+</html>
