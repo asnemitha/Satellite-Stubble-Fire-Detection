@@ -185,7 +185,11 @@ def run_forecast(
             )
 
             # 3. Surcharge -> surface
-            source_terms = surface_source_terms(graph)
+            source_terms = surface_source_terms(
+                graph,
+                cfg.dt_seconds,
+                node_storage_area,
+            )
 
             for node_id, rate in source_terms.items():
                 if node_id not in node_cell_map:
