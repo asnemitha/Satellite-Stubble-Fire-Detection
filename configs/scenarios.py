@@ -9,6 +9,7 @@ believable spread from "nothing to worry about" to "significant street
 flooding" rather than a single fixed storm. See docs/DESIGN.md sec 7 for what
 real calibration against a historical event would require.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -27,21 +28,30 @@ SCENARIOS: dict[str, Scenario] = {
     "light": Scenario(
         id="light",
         label="Light shower",
-        description="Brief light rain. IMD 'light rain' range. Drainage should keep up comfortably.",
+        description=(
+            "Brief light rain. IMD 'light rain' range. "
+            "Drainage should keep up comfortably."
+        ),
         peak_mm_per_hr=12.0,
         duration_note="typical passing shower",
     ),
     "moderate": Scenario(
         id="moderate",
         label="Moderate monsoon rain",
-        description="Steady monsoon rain, IMD 'moderate' range. Minor ponding possible at weak points.",
+        description=(
+            "Steady monsoon rain, IMD 'moderate' range. "
+            "Minor ponding possible at weak points."
+        ),
         peak_mm_per_hr=45.0,
         duration_note="typical monsoon spell",
     ),
     "heavy": Scenario(
         id="heavy",
         label="Heavy monsoon storm",
-        description="IMD 'heavy' to 'very heavy' range. Expect surcharging at undersized/silted pipes.",
+        description=(
+            "IMD 'heavy' to 'very heavy' range. "
+            "Expect surcharging at undersized/silted pipes."
+        ),
         peak_mm_per_hr=85.0,
         duration_note="active monsoon depression",
     ),
@@ -49,8 +59,9 @@ SCENARIOS: dict[str, Scenario] = {
         id="extreme",
         label="Extreme cloudburst",
         description=(
-            "IMD 'extremely heavy rain' territory -- peak intensity in the range "
-            "reported during India's most severe urban cloudburst events. "
+            "IMD 'extremely heavy rain' territory -- "
+            "peak intensity in the range reported during "
+            "India's most severe urban cloudburst events. "
             "Widespread street flooding expected."
         ),
         peak_mm_per_hr=180.0,
@@ -62,5 +73,10 @@ SCENARIOS: dict[str, Scenario] = {
 def get_scenario(scenario_id: str) -> Scenario:
     if scenario_id not in SCENARIOS:
         valid = ", ".join(SCENARIOS)
-        raise KeyError(f"Unknown scenario '{scenario_id}'. Valid options: {valid}")
+
+        raise KeyError(
+            f"Unknown scenario '{scenario_id}'. "
+            f"Valid options: {valid}"
+        )
+
     return SCENARIOS[scenario_id]
