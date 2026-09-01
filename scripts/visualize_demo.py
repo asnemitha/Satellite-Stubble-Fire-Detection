@@ -1,41 +1,52 @@
 """Local, no-server visualization of a demo forecast cycle.
 
-Runs the same `run_one_cycle()` function the CLI and API both use, then
-renders depth-grid snapshots at a few lead times to a PNG. Useful for
-sanity-checking the model on a machine where you don't want to install
-fastapi/uvicorn or open the Leaflet dashboard.
+Runs the same run_one_cycle() function used by the CLI and API,
+then renders depth-grid snapshots at selected lead times to a PNG.
 
 Usage:
     python scripts/visualize_demo.py
-    python scripts/visualize_demo.py --scenario extreme --leads 0 15 30 60 120
+    python scripts/visualize_demo.py --scenario extreme --leads 15 30 60 120
     python scripts/visualize_demo.py --out my_run.png
 """
 
 from __future__ import annotations
 
 import argparse
-import os
 import sys
+from pathlib import Path
 
 import matplotlib
 import matplotlib.pyplot as plt
+import numpy as np
+
+
+# ----------------------------------------------------------------------
+# Configure matplotlib.
+# ----------------------------------------------------------------------
+
+matplotlib.use("Agg")
+
+
+# ----------------------------------------------------------------------
+# Add project root to Python path.
+# ----------------------------------------------------------------------
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+
+# ----------------------------------------------------------------------
+# Project import.
+# ----------------------------------------------------------------------
 
 from src.run_cycle import run_one_cycle
-# Allow running as `python scripts/visualize_demo.py` from the repo root
-# without requiring the package to be installed.
-sys.path.insert(
-    0,
-    os.path.dirname(
-        os.path.dirname(
-            os.path.abspath(__file__)
-        )
-    ),
-)
-
-matplotlib.use("Agg")  # No display needed.
 
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
+
     parser = argparse.ArgumentParser(
         description=__doc__
     )
@@ -49,43 +60,83 @@ def parse_args():
             "heavy",
             "extreme",
         ],
+        help="Rainfall scenario to simulate.",
     )
 
     parser.add_argument(
         "--leads",
         type=int,
         nargs="+",
-        default=[0, 30, 60, 120],
+        default=[15, 30, 60, 120],
         help=(
-            "Lead times (minutes) to render. "
-            "Must be multiples of the output interval "
-            "(15 by default)."
+            "Lead times in minutes to render. "
+            "They must exist in the forecast output."
         ),
     )
 
     parser.add_argument(
         "--out",
         default="demo_frames.png",
+        help="Output PNG filename.",
     )
 
     return parser.parse_args()
 
 
-def main():
+def main() -> None:
+    """Run the forecast and create the visualization."""
+
     args = parse_args()
+
+    # ------------------------------------------------------------------
+    # Validate arguments.
+    # ------------------------------------------------------------------
+
+    if any(lead < 0 for lead in args.leads):
+        raise SystemExit(
+            "Lead times cannot be negative."
+        )
+
+    if len(set(args.leads)) != len(args.leads):
+        raise SystemExit(
+            "Duplicate lead times were provided."
+        )
 
     print(
         f"Running scenario '{args.scenario}'..."
     )
 
-    result = run_one_cycle(
-        scenario_id=args.scenario,
-        verbose=True,
-    )
+    # ------------------------------------------------------------------
+    # Run forecast.
+    # ------------------------------------------------------------------
+
+    try:
+        result = run_one_cycle(
+            scenario_id=args.scenario,
+            verbose=True,
+        )
+    except Exception as exc:
+        print(
+            "\nForecast failed.",
+            file=sys.stderr,
+        )
+        print(
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        raise
+
+    # ------------------------------------------------------------------
+    # Extract forecast data.
+    # ------------------------------------------------------------------
 
     depth_by_lead = result["depth_by_lead"]
     meta = result["meta"]
     node_cell_map = result["node_cell_map"]
+
+    available = sorted(
+        depth_by_lead.keys()
+    )
 
     missing = [
         lead
@@ -94,95 +145,183 @@ def main():
     ]
 
     if missing:
-        available = sorted(
-            depth_by_lead.keys()
+        raise SystemExit(
+            "\nRequested lead times are not available.\n"
+            f"Requested: {missing}\n"
+            f"Available: {available}\n\n"
+            "Use one of the available lead times with --leads."
         )
 
-        sys.exit(
-            f"Requested leads {missing} "
-            f"not in this run's output "
-            f"(available: {available})."
+    # ------------------------------------------------------------------
+    # Find chronic flood point.
+    # ------------------------------------------------------------------
+
+    chronic_node = meta.get(
+        "chronic_flood_node"
+    )
+
+    if chronic_node is None:
+        raise SystemExit(
+            "Metadata does not contain 'chronic_flood_node'."
         )
+
+    if chronic_node not in node_cell_map:
+        raise SystemExit(
+            f"Chronic flood node '{chronic_node}' "
+            "is missing from node_cell_map."
+        )
+
+    chronic_row, chronic_col = node_cell_map[
+        chronic_node
+    ]
+
+    # ------------------------------------------------------------------
+    # Create figure.
+    # ------------------------------------------------------------------
+
+    n_plots = len(args.leads)
 
     fig, axes = plt.subplots(
         1,
-        len(args.leads),
+        n_plots,
         figsize=(
-            4 * len(args.leads),
-            4.2,
+            max(4.0 * n_plots, 5.0),
+            4.5,
         ),
+        squeeze=False,
     )
 
-    if len(args.leads) == 1:
-        axes = [axes]
+    axes = axes[0]
 
-    vmax = (
-        max(
-            depth_by_lead[lead].max()
-            for lead in args.leads
+    # ------------------------------------------------------------------
+    # Common colour scale.
+    # ------------------------------------------------------------------
+
+    vmax = max(
+        float(
+            np.max(depth_by_lead[lead])
         )
-        or 1.0
+        for lead in args.leads
     )
 
-    im = None
+    if vmax <= 0.0 or not np.isfinite(vmax):
+        vmax = 1.0
 
-    for ax, lead in zip(axes, args.leads):
-        grid = depth_by_lead[lead]
+    # ------------------------------------------------------------------
+    # Render forecast frames.
+    # ------------------------------------------------------------------
 
-        im = ax.imshow(
+    image = None
+
+    for ax, lead in zip(
+        axes,
+        args.leads,
+    ):
+        grid = np.asarray(
+            depth_by_lead[lead],
+            dtype=float,
+        )
+
+        # Check dimensions.
+        if grid.ndim != 2:
+            raise ValueError(
+                f"Depth grid at t+{lead} min is not 2D: "
+                f"shape={grid.shape}"
+            )
+
+        # Check values.
+        if not np.isfinite(grid).all():
+            raise ValueError(
+                f"Depth grid at t+{lead} min contains "
+                "NaN or infinite values."
+            )
+
+        # Plot depth.
+        image = ax.imshow(
             grid,
             cmap="Blues",
-            vmin=0,
+            vmin=0.0,
             vmax=vmax,
+            interpolation="nearest",
         )
 
         ax.set_title(
             f"t+{lead} min\n"
-            f"max {grid.max():.0f} cm",
+            f"max {grid.max():.1f} cm",
             fontsize=11,
         )
 
         ax.set_xticks([])
         ax.set_yticks([])
 
-        # Mark the network's known chronic flood point for reference.
-        r, c = node_cell_map[
-            meta["chronic_flood_node"]
-        ]
-
+        # Mark chronic flood point.
         ax.plot(
-            c,
-            r,
+            chronic_col,
+            chronic_row,
             marker="x",
             color="red",
-            markersize=8,
+            markersize=9,
             markeredgewidth=2,
         )
 
+    # ------------------------------------------------------------------
+    # Figure title.
+    # ------------------------------------------------------------------
+
     fig.suptitle(
         (
-            f"'{args.scenario}' scenario -- "
-            "depth (cm), chronic flood node "
-            "marked in red"
+            f"'{args.scenario}' scenario — "
+            "surface water depth"
         ),
-        fontsize=12,
+        fontsize=13,
     )
 
-    fig.colorbar(
-        im,
-        ax=axes,
-        shrink=0.8,
-        label="depth (cm)",
+    # ------------------------------------------------------------------
+    # Shared colour bar.
+    # ------------------------------------------------------------------
+
+    if image is not None:
+        fig.colorbar(
+            image,
+            ax=axes.tolist(),
+            shrink=0.8,
+            label="Depth (cm)",
+        )
+
+    # ------------------------------------------------------------------
+    # Layout.
+    # ------------------------------------------------------------------
+
+    fig.tight_layout(
+        rect=(0.0, 0.0, 1.0, 0.93)
+    )
+
+    # ------------------------------------------------------------------
+    # Save.
+    # ------------------------------------------------------------------
+
+    output_path = Path(
+        args.out
+    ).expanduser()
+
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
     )
 
     fig.savefig(
-        args.out,
+        output_path,
         dpi=130,
         bbox_inches="tight",
     )
 
+    plt.close(fig)
+
     print(
-        f"Saved {args.out}"
+        "\nSaved visualization to:"
+    )
+    print(
+        f"  {output_path.resolve()}"
     )
 
 
